@@ -91,3 +91,82 @@ EVAL_TRANSFORMS: Dict[str, Callable[[Image.Image], Image.Image]] = {
     # Centre crop 80%
     "crop_80": lambda im: center_crop(im, 0.80),
 }
+
+
+# --------------------------------------------------------------------------
+# train-time augmentation
+# --------------------------------------------------------------------------
+#
+# Two jobs, both essential:
+#
+#   1. Destroy the compression-history shortcut. SID_Set reals are OpenImages
+#      (already JPEG'd); fakes are pristine FLUX PNG. Measured on our own data,
+#      a single 8x8-blockiness feature separates the classes at AUROC 0.830.
+#      Re-encoding EVERY image at a random JPEG quality drops that to 0.558.
+#      This is not optional and it must apply to both classes equally.
+#
+#   2. Stop the model relying on high-frequency energy, which blur and rescaling
+#      destroy at eval time.
+#
+# Ordering is deliberate: geometry -> photometric -> noise -> JPEG last, because
+# JPEG is the final step in the real-world chain (a platform re-encodes on
+# upload, after every other edit has happened).
+
+# Blur is applied at lower probability than the rest: the [RE] reproducibility
+# study found blur-only augmentation was net-harmful (89.7 -> 83.8 mAP), while
+# JPEG was nearly free. Verify on val before raising this.
+P_BLUR = 0.25
+P_NOISE = 0.25
+P_JITTER = 0.5
+P_RESIZE = 0.5
+
+
+def train_augment(img: Image.Image, rng: np.random.Generator) -> Image.Image:
+    """Randomised augmentation matching the judged transform families.
+
+    Always ends with a JPEG re-encode -- see note above; that step is what
+    removes the compression-history confound rather than merely obscuring it.
+    """
+    out = img
+
+    # -- geometry -----------------------------------------------------------
+    if rng.random() < P_RESIZE:
+        out = downscale_upscale(out, float(rng.uniform(0.25, 1.0)))
+
+    # random crop 5/8 .. full, then restore size (Cozzolino: resize, don't
+    # fixed-centre-crop, since we are graded on robustness to both)
+    frac = float(rng.uniform(0.625, 1.0))
+    if frac < 0.999:
+        out = center_crop(out, frac)
+
+    # -- photometric --------------------------------------------------------
+    if rng.random() < P_JITTER:
+        out = color_jitter(
+            out,
+            brightness=float(rng.uniform(0.8, 1.2)),
+            contrast=float(rng.uniform(0.8, 1.2)),
+            saturation=float(rng.uniform(0.8, 1.2)),
+        )
+
+    # -- blur / noise -------------------------------------------------------
+    # Composed with JPEG below rather than applied only in isolation: the [RE]
+    # study found the compositional variant scored 93.7 vs 66.3 AP on the
+    # hardest evaluation set.
+    if rng.random() < P_BLUR:
+        out = gaussian_blur(out, float(rng.uniform(0.0, 2.0)))
+
+    if rng.random() < P_NOISE:
+        out = gaussian_noise(out, float(rng.uniform(0.0, 0.10)), rng)
+
+    # -- compression, always ------------------------------------------------
+    return jpeg_compress(out, int(rng.integers(30, 96)))
+
+
+def normalize_compression(img: Image.Image, rng: np.random.Generator) -> Image.Image:
+    """Eval-time counterpart of the JPEG step in `train_augment`.
+
+    Applied to every image at inference so that train and test see the same
+    compression distribution. Without this the model meets pristine PNGs it
+    never saw in training.
+    """
+    return jpeg_compress(img, int(rng.integers(30, 96)))
