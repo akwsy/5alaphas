@@ -181,26 +181,30 @@ and reruns without a shared seed file.
 
 ## 3. Model
 
-Backbone: **`openai/clip-vit-large-patch14`, frozen, 427.6M params** (verified
-against HuggingFace safetensors metadata; comfortably under the 2B limit).
-Features from the **penultimate layer, 768-d**.
+Backbone: **`openai/clip-vit-large-patch14`, frozen, vision tower only.**
+**303.2M params, verified by instantiation** (the 427.6M figure from initial
+research was the full CLIP model including the unused text encoder -- we only
+need the vision half). Features from the **penultimate hidden layer, CLS token,
+1024-d** (ViT-L hidden size; not 768, which is ViT-B -- corrected after
+actually running the model).
 
 ### 3.0 Model inventory — one trainable model, two components
 
 The entire system is **one model**. Only the head has learnable parameters.
 
 ```
-image -> [random JPEG re-encode] -> CLIP ViT-L/14 (FROZEN) -> 768-d -> LinearSVC -> P(fake)
-                                        427.6M params                  ~769 params
+image -> [random JPEG re-encode] -> CLIP ViT-L/14 vision (FROZEN) -> 1024-d -> LinearSVC -> P(fake)
+                                        303.2M params                      ~1025 params
 ```
 
 | Component | Params | Trained? | Role |
 |---|---|---|---|
-| `openai/clip-vit-large-patch14` | 427.6M | **No -- frozen, no grad** | Pretrained feature extractor. Image -> 768-d vector. |
-| LinearSVC head | ~769 (768 w + 1 b) | **Yes** | The only learned component. One hyperplane in feature space. |
+| `openai/clip-vit-large-patch14` (vision tower) | 303.2M | **No -- frozen, no grad** | Pretrained feature extractor. Image -> 1024-d vector. |
+| LinearSVC head | ~1,025 (1024 w + 1 b) | **Yes** | The only learned component. One hyperplane in feature space. |
 
-Total parameter count for the <2B compliance check: **427.6M**. Assert this in
-code rather than trusting this table.
+Total parameter count for the <2B compliance check: **303.2M**, asserted in
+code at `FeatureExtractor.__init__` (`src/features.py`) -- the constructor
+raises if it is ever exceeded, so this is enforced, not just documented.
 
 Things elsewhere in this spec that are **not** extra models:
 

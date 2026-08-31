@@ -1,44 +1,130 @@
-# AI-Generated Image Detection — TikTok TechJam
+# Robust AI-Generated Image Detection — TikTok TechJam 2026
 
-Binary classifier distinguishing real photographs from fully AI-generated images.
+Binary classifier distinguishing real photographs from AI-generated images,
+built for robustness under JPEG re-compression, blur, resize, noise, colour
+jitter, and cropping. Full design rationale, measured shortcut evidence, and
+targets are in [`docs/SPEC.md`](docs/SPEC.md) — this file is setup +
+reproduction only.
 
-## Data
+## How it works
 
-[`fetch_data.py`](fetch_data.py) streams [SID_Set](https://huggingface.co/datasets/saberzl/SID_Set)
-and writes a balanced subset to `data/raw/{real,fake}/`.
+One model. Only the head is trained.
 
-Label mapping (verified against `img_id` prefixes and mask presence):
+```
+image -> [random JPEG re-encode] -> CLIP ViT-L/14 vision tower (FROZEN, 303M) -> 1024-d -> LinearSVC -> P(fake)
+```
 
-| label | meaning | kept |
-|---|---|---|
-| 0 | real photograph | yes |
-| 1 | fully synthetic | yes |
-| 2 | tampered region | no — localization task, not our problem |
-
-Two decisions in the loader are deliberate and should not be "cleaned up":
-
-- **Everything saves as PNG.** Mixed formats let the model learn JPEG artifacts as
-  a class signal — it scores ~99% locally and collapses on the real test set.
-- **Centre-crop, never resize.** Resampling is a low-pass filter that smears the
-  high-frequency generator fingerprints the detector depends on. Cropping leaves
-  surviving pixels bit-exact.
+The backbone never receives a gradient. "Training" is: extract a 1024-d CLIP
+feature per image once, then fit a linear classifier on the cached vectors —
+seconds of CPU work, no epochs, no GPU scheduling. See `docs/SPEC.md` §3 and
+§8b for why a frozen backbone generalises across generators better than a
+fine-tuned CNN, and for the measured time budget (~15 min of GPU work total).
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/hf auth login          # HuggingFace read token
-.venv/bin/python fetch_data.py   # resumable; re-run to top up
+source .venv/bin/activate        # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
 ```
+
+No `.env` file and no required environment variables. The only external
+service touched is the Hugging Face Hub, for two **public, ungated** resources:
+
+- `openai/clip-vit-large-patch14` (the frozen backbone)
+- `techjam-aigc/wildfake-eval-subset` (the organisers' held-out eval set)
+
+Both download anonymously. A Hugging Face token is **optional** — it only
+raises your download rate limit, it does not unlock anything otherwise
+inaccessible:
+
+```bash
+huggingface-cli login             # optional; paste a read-scope token
+# or, without persisting a login:
+export HF_TOKEN=hf_xxxxxxxxxxxx   # optional, read by huggingface_hub/datasets/transformers directly
+```
+
+One optional variable worth setting on Kaggle or any disk-constrained machine,
+so the Hugging Face cache doesn't fill your working quota:
+
+```bash
+export HF_HOME=/kaggle/temp/hf    # optional; defaults to ~/.cache/huggingface
+```
+
+That's the full list. Nothing in this repo requires a paid API key, a database
+URL, or any other secret.
+
+## Reproduce the results
+
+```bash
+# 1. Download training data (resumable; re-run to top up if interrupted)
+python fetch_data.py
+
+# 2. Extract CLIP features and fit both heads (with/without augmentation --
+#    this is the ablation in SPEC.md SS5.2). Takes ~15 min on a T4, longer on CPU.
+python -m src.train --data-dir data/raw --out-dir artifacts
+
+# 3. Score both heads across the 16-transform robustness grid plus the
+#    organisers' held-out eval set (downloads ~600MB-3GB from HF on first run)
+python -m src.evaluate --artifacts-dir artifacts --out docs/RESULTS.md
+
+# 4. Sample and render the worst false positives / false negatives
+python -m src.error_analysis --artifacts-dir artifacts --out docs/error_analysis
+
+# 5. Score an arbitrary directory of images -- this is the scored deliverable
+python predict.py --input-dir path/to/images --output preds.json
+
+# 6. Launch the demo UI (for the submission video)
+python -m src.app --head artifacts/head_aug.joblib
+```
+
+Each step only needs the previous step's output on disk; `train.py` and
+`evaluate.py` cache every embedding to `artifacts/features/*.npz`, so re-runs
+after the first never recompute a CLIP forward pass.
+
+`predict.py`'s output schema is fixed by the problem statement:
+
+```json
+[{"image_path": "imgs/a.jpg", "pred": 0.9213}, {"image_path": "imgs/b.jpg", "pred": 0.0142}]
+```
+
+`pred` is `P(image is AI-generated)` in `[0, 1]`, not a hard label.
+`image_path` is relative to `--input-dir`. A corrupt or unreadable file gets
+`pred: 0.5` and a stderr warning rather than aborting the run.
 
 ## Layout
 
-| path | role | owner |
-|---|---|---|
-| `fetch_data.py` | dataset download | — |
-| `src/transforms.py` | augmentation / preprocessing | |
-| `src/data.py` | dataset + dataloaders | |
-| `src/train.py` | training loop | |
-| `src/evaluate.py` | metrics, confusion matrix | |
-| `src/app.py` | demo UI | |
+| path | role |
+|---|---|
+| `fetch_data.py` | SID_Set downloader (resumable, balanced real/fake) |
+| `predict.py` | **scored deliverable**: image dir -> JSON |
+| `src/transforms.py` | frozen 16-cell robustness grid + train-time augmentation |
+| `src/data.py` | dataset assembly, hash-based reproducible train/val split |
+| `src/features.py` | frozen CLIP feature extraction + on-disk caching |
+| `src/train.py` | fits the linear head (with/without augmentation, for the ablation) |
+| `src/evaluate.py` | robustness grid -> `docs/RESULTS.md` |
+| `src/error_analysis.py` | worst false positives/negatives -> contact sheets |
+| `src/app.py` | Gradio demo UI |
+| `docs/SPEC.md` | full design rationale, measured shortcuts, targets |
+| `docs/RESULTS.md` | generated by `evaluate.py` |
+
+## Limitations and what we'd improve with more time
+
+- Trained only on SID_Set (FLUX-generated fakes, OpenImages reals); the
+  organisers' eval set uses DALL·E 3, a generator we never train on by
+  design (see `docs/SPEC.md` §3.2 for why that gap is the hard part of this
+  problem, and why a frozen backbone is the mitigation rather than more data).
+- `LinearSVC` on frozen CLIP features is a strong, fast baseline, not a
+  ceiling. With more time: sweep larger backbones (`docs/SPEC.md` §3.7), and
+  try late fusion with a pretrained low-level/frequency detector for a further
+  accuracy gain on top of, not instead of, the CLIP features.
+- The augmentation ranges (JPEG quality, blur sigma, crop fraction) were set
+  from the problem statement's own transform table, not independently tuned;
+  a held-out sweep could tighten them further.
+- No calibration beyond a single Youden's-J threshold on clean validation data;
+  a production system would calibrate per deployment surface (see
+  `docs/SPEC.md` §6).
+
+## Team member contributions
+
+_Fill in before submission._

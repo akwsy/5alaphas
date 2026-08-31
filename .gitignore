@@ -1,6 +1,7 @@
 data/
 .venv/
 fetch.log
+run_fetch.sh
 __pycache__/
 *.pyc
 *.pt
@@ -8,3 +9,8 @@ __pycache__/
 *.ckpt
 .ipynb_checkpoints/
 .DS_Store
+artifacts/
+docs/error_analysis/
+*.joblib
+*.npz
+preds.json
