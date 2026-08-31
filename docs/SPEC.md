@@ -185,6 +185,39 @@ Backbone: **`openai/clip-vit-large-patch14`, frozen, 427.6M params** (verified
 against HuggingFace safetensors metadata; comfortably under the 2B limit).
 Features from the **penultimate layer, 768-d**.
 
+### 3.0 Model inventory — one trainable model, two components
+
+The entire system is **one model**. Only the head has learnable parameters.
+
+```
+image -> [random JPEG re-encode] -> CLIP ViT-L/14 (FROZEN) -> 768-d -> LinearSVC -> P(fake)
+                                        427.6M params                  ~769 params
+```
+
+| Component | Params | Trained? | Role |
+|---|---|---|---|
+| `openai/clip-vit-large-patch14` | 427.6M | **No -- frozen, no grad** | Pretrained feature extractor. Image -> 768-d vector. |
+| LinearSVC head | ~769 (768 w + 1 b) | **Yes** | The only learned component. One hyperplane in feature space. |
+
+Total parameter count for the <2B compliance check: **427.6M**. Assert this in
+code rather than trusting this table.
+
+Things elsewhere in this spec that are **not** extra models:
+
+- **The augmentation ablation (SS5.2)** -- two *fits* of the same head on the same
+  cached features, one with `train_augment` and one without. Two runs, one
+  architecture.
+- **The torch linear layer (SS3.3)** -- an alternative head type fit on identical
+  features to confirm LinearSVC is the better pick. Seconds to run. Ship one.
+- **Optional backbones (SS3.7)** -- *replacements* for ViT-L/14, not additions.
+- **Late fusion (SS3.6)** -- explicitly deferred; likely will not happen.
+
+**There is no fine-tuning path.** An earlier draft had one; it was removed
+deliberately. The frozen backbone is *the reason* the approach generalises
+FLUX -> DALL-E 3 (see SS3.1), so fine-tuning it would undo the central design
+decision. If someone proposes unfreezing the backbone, that is a change to the
+project's thesis, not an optimisation.
+
 ### 3.1 Why frozen CLIP rather than a fine-tuned CNN
 
 A CNN trained from scratch becomes *asymmetrically tuned*: it learns "what makes
@@ -393,7 +426,7 @@ src/
   transforms.py      frozen 16-cell eval grid + train-time augmentation (done)
   data.py            dataset, hash-based splits, loaders
   features.py        CLIP embedding extraction + on-disk cache
-  train.py           linear probe + fine-tune paths
+  train.py           fits the linear head (with/without aug, for the ablation)
   evaluate.py        robustness grid -> results table
   error_analysis.py  FP/FN sampling with rendered contact sheets
   app.py             demo UI for the video
