@@ -464,6 +464,96 @@ then mount into the next notebook via Add Data -> Kernel Output Files. For
 anything durable, push to HF Hub — it survives quota exhaustion and teammates
 can pull it.
 
+## 8b. Training procedure and time budget
+
+### The key economy
+
+**The backbone is frozen, so it runs exactly once per (image, transform) pair.**
+Everything downstream operates on cached 768-d vectors. This is why the whole
+project costs minutes rather than hours, and why the ablation is affordable.
+
+```
+                   ONCE, on GPU                    REPEATEDLY, on CPU
+  image -> augment -> CLIP fwd -> 768-d .npy  ->   fit LinearSVC -> metrics
+           (CPU)      (no grad)     cached          (seconds)
+```
+
+There is no backprop through the backbone, no epochs, no learning-rate schedule,
+no early stopping on the backbone. "Training" is: extract features, then fit a
+linear classifier.
+
+### Step by step
+
+**1. Extract embeddings (GPU, the only expensive step).**
+For each image: augment (or apply an eval transform) -> CLIP preprocess ->
+forward with `torch.no_grad()` under `autocast(dtype=torch.float16)` -> take the
+penultimate 768-d vector -> append to an array. Save as `.npy` alongside labels.
+
+Extract these sets:
+
+| Set | Images | Purpose |
+|---|---|---|
+| train, **no** augmentation | 12,000 | ablation baseline |
+| train, **with** `train_augment` | 12,000 | the real model |
+| val x 16-cell grid | 38,400 | in-distribution robustness table |
+| `laion_matched` x 16-cell grid | 122,432 | **headline** robustness table |
+| `cross_generator`, clean | 5,494 | multi-generator generalisation |
+
+Total ~190,000 forward passes.
+
+**2. Fit the head (CPU, seconds).** `LinearSVC` on the cached train vectors.
+Calibrate a threshold on clean val. Refits cost nothing, so sweep `C` properly.
+
+**3. Score.** Load cached eval vectors, apply the head, compute AUROC / accuracy
+@ fixed threshold / TPR@1%FPR / TPR@5%FPR per cell.
+
+**4. Ablation.** Repeat steps 2-3 against the no-augmentation features. Report
+the signed delta.
+
+### Measured time budget
+
+Throughput measured on this machine, not estimated:
+
+| Stage | Measured |
+|---|---|
+| PNG load + decode | 5.4 ms/img |
+| `train_augment` | 12.5 ms/img |
+| One image through all 16 eval cells | 85 ms |
+| CLIP ViT-L/14 fwd, one T4 fp16 (est.) | ~225 img/s |
+| CPU pipeline, 4 Kaggle vCPU | ~223 img/s |
+
+**CPU and GPU throughput are near-identical (223 vs 225 img/s), so the pipeline
+is balanced.** Use `num_workers=4`; more will not help, fewer will starve the GPU.
+
+| Phase | Wall clock |
+|---|---|
+| Train features, both variants (24,000 imgs) | ~2 min |
+| Val robustness grid (38,400) | ~3 min |
+| `laion_matched` robustness grid (122,432) | ~9 min |
+| `cross_generator` (5,494) | ~0.5 min |
+| **Total GPU/extraction** | **~15 min** |
+| Head fitting, all variants | seconds |
+| **End-to-end, including overhead** | **~30 min** |
+
+Against a 12 h session limit and a 30 h weekly quota, this is nothing. **Do not
+architect around Kaggle's limits -- they will not bind.** Budget the day for
+debugging, error analysis, and the writeup instead.
+
+### Practical notes
+
+- **Cache aggressively.** Write embeddings to `/kaggle/working/emb/*.npy` and
+  commit the notebook version. A re-run then skips extraction entirely, and
+  teammates can pull the features instead of recomputing.
+- **T4 has no bfloat16.** Use `torch.float16` + `autocast`; bf16 will fail or
+  silently fall back.
+- Set `HF_HOME=/kaggle/temp/hf` before `load_dataset`, or the cache eats the
+  20 GB working quota.
+- Extraction is embarrassingly parallel and restartable -- write per-shard `.npy`
+  files so a dropped session resumes rather than restarting.
+- **Sanity gate before the full run:** extract 200 images, fit, and confirm clean
+  val AUROC > 0.9. If it is at chance, something is wired wrong; finding that out
+  after 15 minutes is much better than after the grid.
+
 ## 9. Sequencing and ownership
 
 Dependency-ordered. Critical path: features -> train -> evaluate.
